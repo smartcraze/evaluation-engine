@@ -1,7 +1,10 @@
 import os
+from pathlib import Path
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from dotenv import load_dotenv
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from services.datalab import convert_to_markdown_via_sdk, submit_for_webhook_processing
 from services.evaluator import DEFAULT_MAX_MARKS, DEFAULT_MODEL, EvaluationError, evaluate_exam_text
@@ -11,10 +14,20 @@ load_dotenv()
 
 app = FastAPI()
 
+BASE_DIR = Path(__file__).resolve().parent
+PUBLIC_DIR = BASE_DIR / "public"
+
+app.mount("/public", StaticFiles(directory=str(PUBLIC_DIR)), name="public")
+
 
 @app.on_event("startup")
 async def startup() -> None:
     await init_db()
+
+
+@app.get("/")
+async def serve_frontend() -> FileResponse:
+    return FileResponse(str(PUBLIC_DIR / "index.html"))
 
 
 
