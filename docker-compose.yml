@@ -13,16 +13,6 @@ services:
       - postgres_data:/var/lib/postgresql/data
     restart: always
 
-  valkey:
-    image: valkey/valkey:latest
-    container_name: valkey_queue
-    ports:
-      - "6379:6379"
-    command: ["valkey-server", "--save", "60", "1", "--loglevel", "warning"]
-    volumes:
-      - valkey_data:/data
-    restart: always
-
+  
 volumes:
   postgres_data:
-  valkey_data:

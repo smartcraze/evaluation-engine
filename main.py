@@ -3,31 +3,80 @@ import os
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from dotenv import load_dotenv
 
-from services.datalab import submit_and_get_request_id
+from services.datalab import convert_to_markdown_via_sdk, submit_for_webhook_processing
 from services.evaluator import DEFAULT_MAX_MARKS, DEFAULT_MODEL, EvaluationError, evaluate_exam_text
+from services.storage import get_job, init_db, save_evaluation, upsert_job
 
 load_dotenv()
 
 app = FastAPI()
 
-# Temporary in-memory store for webhook payloads in V1.
-# Replace with PostgreSQL persistence in the next step.
-WEBHOOK_RESULTS: dict[str, dict] = {}
+
+@app.on_event("startup")
+async def startup() -> None:
+    await init_db()
 
 
 
 
-@app.post("/convert")
-async def convert(file: UploadFile = File(...)):
+async def _convert_localhost(file: UploadFile) -> dict:
     try:
-        result = await submit_and_get_request_id(file)
+        result = await convert_to_markdown_via_sdk(file)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    request_id = result["request_id"]
+    markdown = result["markdown"]
+    await upsert_job(
+        request_id=request_id,
+        status="received",
+        mode="localhost-sdk-auto-poll",
+        extracted_text=markdown,
+        payload={"source": "datalab-sdk-auto-poll"},
+    )
+
+    return {
+        "status": "received",
+        "request_id": request_id,
+        "markdown_length": len(markdown),
+        "mode": "localhost-sdk-auto-poll",
+    }
+
+
+@app.post("/convert")
+async def convert(file: UploadFile = File(...)):
+    return await _convert_localhost(file)
+
+
+@app.post("/convert/localhost")
+async def convert_localhost(file: UploadFile = File(...)):
+    return await _convert_localhost(file)
+
+
+@app.post("/convert/webhook")
+async def convert_webhook(file: UploadFile = File(...)):
+    try:
+        result = await submit_for_webhook_processing(file)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    request_id = result["request_id"]
+    await upsert_job(
+        request_id=request_id,
+        status="submitted",
+        mode="deployed-webhook",
+        request_check_url=result.get("request_check_url"),
+        extracted_text=None,
+        payload={"source": "datalab-webhook-mode", **result},
+    )
+
     return {
         "status": "submitted",
+        "mode": "deployed-webhook",
         **result,
     }
     
@@ -47,29 +96,30 @@ async def datalab_webhook(request: Request):
         raise HTTPException(status_code=400, detail="request_id or job_id is required")
 
     extracted_text = data.get("markdown") or data.get("extracted_text")
-    WEBHOOK_RESULTS[str(request_id)] = {
-        "payload": data,
-        "extracted_text": extracted_text,
-        "status": "received",
-    }
+    await upsert_job(
+        request_id=str(request_id),
+        status="received",
+        extracted_text=extracted_text,
+        payload=data,
+    )
 
     return {"status": "received"}
 
 
 @app.get("/result/{request_id}")
 async def get_result(request_id: str):
-    data = WEBHOOK_RESULTS.get(request_id)
-    if not data:
+    job = await get_job(request_id)
+    if not job:
         raise HTTPException(status_code=404, detail="request_id not found")
 
     return {
         "request_id": request_id,
-        "status": data.get("status", "unknown"),
-        "marks": data.get("marks"),
-        "remarks": data.get("remarks"),
-        "matched_keywords": data.get("matched_keywords"),
-        "missing_keywords": data.get("missing_keywords"),
-        "model": data.get("model"),
+        "status": job.status,
+        "marks": job.marks,
+        "remarks": job.remarks,
+        "matched_keywords": job.matched_keywords,
+        "missing_keywords": job.missing_keywords,
+        "model": job.model_name,
     }
 
 
@@ -78,8 +128,8 @@ async def evaluate_extracted_answer(
     request_id: str,
     request: Request,
 ):
-    data = WEBHOOK_RESULTS.get(request_id)
-    if not data:
+    job = await get_job(request_id)
+    if not job:
         raise HTTPException(status_code=404, detail="request_id not found")
 
     try:
@@ -87,7 +137,7 @@ async def evaluate_extracted_answer(
     except Exception:
         body = {}
 
-    extracted_exam_text = (data.get("extracted_text") or "").strip()
+    extracted_exam_text = (job.extracted_text or "").strip()
     if not extracted_exam_text:
         raise HTTPException(status_code=400, detail="No extracted text received for this request_id")
 
@@ -105,12 +155,14 @@ async def evaluate_extracted_answer(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Evaluation failed: {exc}") from exc
 
-    WEBHOOK_RESULTS[request_id]["status"] = "completed"
-    WEBHOOK_RESULTS[request_id]["marks"] = evaluation["marks"]
-    WEBHOOK_RESULTS[request_id]["remarks"] = evaluation["remarks"]
-    WEBHOOK_RESULTS[request_id]["matched_keywords"] = evaluation["matched_keywords"]
-    WEBHOOK_RESULTS[request_id]["missing_keywords"] = evaluation["missing_keywords"]
-    WEBHOOK_RESULTS[request_id]["model"] = evaluation["model"]
+    await save_evaluation(
+        request_id=request_id,
+        marks=evaluation["marks"],
+        remarks=evaluation["remarks"],
+        matched_keywords=evaluation["matched_keywords"],
+        missing_keywords=evaluation["missing_keywords"],
+        model_name=evaluation["model"],
+    )
 
     return {
         "request_id": request_id,
