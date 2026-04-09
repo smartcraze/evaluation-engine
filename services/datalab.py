@@ -73,7 +73,7 @@ def _extract_markdown(result: Any) -> str:
 
 async def convert_to_markdown_via_sdk(
     file: UploadFile,
-    mode: str = "accurate",
+    mode: str = "balanced",
 ) -> dict[str, Any]:
     """Convert file using Datalab SDK and wait for markdown result."""
     api_key = _required_env("DATALAB_API_KEY")
@@ -92,12 +92,10 @@ async def convert_to_markdown_via_sdk(
             tmp.write(file_bytes)
             temp_path = tmp.name
 
+        # Keep options minimal for maximum API compatibility.
         options = ConvertOptions(
             output_format="markdown",
             mode=mode,
-            paginate=True,
-            max_pages=10,
-            page_range="0-5,10",
         )
 
         async_client = AsyncDatalabClient(
@@ -139,10 +137,7 @@ async def submit_for_webhook_processing(
     }
     payload_data = {
         "output_format": output_format,
-        "mode": "accurate",
-        "paginate": "true",
-        "max_pages": "10",
-        "page_range": "0-5,10",
+        "mode": "balanced",
         "webhook_url": webhook_url,
     }
 

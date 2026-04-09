@@ -1,11 +1,12 @@
 import json
 import os
+import re
 from typing import Any
 
 from openai import AsyncOpenAI
 
 
-DEFAULT_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
+DEFAULT_MODEL = "openai/gpt-oss-120b:free"
 DEFAULT_MAX_MARKS = 100
 
 
@@ -18,6 +19,27 @@ def _required_env(name: str) -> str:
     if not value:
         raise EvaluationError(f"Missing required environment variable: {name}")
     return value
+
+
+def _normalize_keywords(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    normalized: list[str] = []
+    for item in items:
+        text = re.sub(r"\s+", " ", item.strip().lower())
+        if not text:
+            continue
+        if text not in seen:
+            seen.add(text)
+            normalized.append(text)
+    return normalized
+
+
+def _deterministic_marks(max_marks: int, matched_keywords: list[str], missing_keywords: list[str]) -> float:
+    total_keywords = len(matched_keywords) + len(missing_keywords)
+    if total_keywords == 0:
+        return float(max_marks) * 0.5
+    coverage = len(matched_keywords) / total_keywords
+    return round(max(0.0, min(float(max_marks), float(max_marks) * coverage)), 2)
 
 
 def _build_system_prompt(max_marks: int) -> str:
@@ -79,6 +101,10 @@ VALIDATION CHECKLIST BEFORE FINAL OUTPUT
 - Are remarks clear and deduction-focused?
 - Are matched_keywords and missing_keywords arrays of strings?
 - Is the response strictly valid JSON with exactly four keys?
+
+CONSISTENCY REQUIREMENT
+- For identical input text, keep keyword extraction and grading decision stable.
+- Prefer deterministic keyword identification over creative paraphrasing.
 """.strip()
 
 
@@ -111,7 +137,10 @@ async def evaluate_exam_text(
             {"role": "system", "content": _build_system_prompt(max_marks)},
             {"role": "user", "content": user_prompt},
         ],
-        temperature=0.1,
+        temperature=0,
+        top_p=1,
+        frequency_penalty=0,
+        presence_penalty=0,
         extra_headers={
             "HTTP-Referer": os.getenv("BASE_URL", "http://localhost"),
             "X-OpenRouter-Title": os.getenv("APP_NAME", "evaluation-engine"),
@@ -142,12 +171,30 @@ async def evaluate_exam_text(
     ):
         raise EvaluationError("Invalid missing_keywords returned by model")
 
-    bounded_marks = max(0.0, min(float(max_marks), float(marks)))
+    normalized_matched_keywords = _normalize_keywords(matched_keywords)
+    normalized_missing_keywords = _normalize_keywords(missing_keywords)
+
+    # Ensure a keyword does not appear in both lists.
+    matched_set = set(normalized_matched_keywords)
+    normalized_missing_keywords = [item for item in normalized_missing_keywords if item not in matched_set]
+
+    # Use deterministic final score from keyword coverage to reduce run-to-run drift.
+    deterministic_marks = _deterministic_marks(
+        max_marks=max_marks,
+        matched_keywords=normalized_matched_keywords,
+        missing_keywords=normalized_missing_keywords,
+    )
+
+    bounded_marks = max(0.0, min(float(max_marks), deterministic_marks))
+
+    if not isinstance(marks, (int, float)):
+        marks = bounded_marks
 
     return {
         "marks": bounded_marks,
         "remarks": remarks.strip(),
-        "matched_keywords": matched_keywords,
-        "missing_keywords": missing_keywords,
+        "matched_keywords": normalized_matched_keywords,
+        "missing_keywords": normalized_missing_keywords,
         "model": model,
+        "llm_marks": float(marks),
     }

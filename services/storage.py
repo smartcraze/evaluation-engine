@@ -1,4 +1,5 @@
 import os
+import re
 from datetime import datetime
 from typing import Any
 
@@ -112,3 +113,62 @@ async def save_evaluation(
         job.missing_keywords = missing_keywords
         job.model_name = model_name
         await session.commit()
+
+
+def _estimate_markdown_quality_score(text: str) -> float:
+    if not text:
+        return 0.0
+
+    total_chars = len(text)
+    printable_chars = sum(1 for ch in text if ch.isprintable() and ch != "\x0b" and ch != "\x0c")
+    alnum_chars = sum(1 for ch in text if ch.isalnum())
+    word_count = len(re.findall(r"\b\w+\b", text))
+
+    printable_ratio = printable_chars / total_chars if total_chars else 0.0
+    alpha_numeric_ratio = alnum_chars / total_chars if total_chars else 0.0
+    density_score = min(word_count / 120.0, 1.0)
+
+    score = (printable_ratio * 0.45) + (alpha_numeric_ratio * 0.35) + (density_score * 0.20)
+    return max(0.0, min(1.0, score))
+
+
+async def get_markdown_metrics() -> dict[str, Any]:
+    async with SessionLocal() as session:
+        stmt = select(EvaluationJob.request_id, EvaluationJob.extracted_text)
+        result = await session.execute(stmt)
+        rows = result.all()
+
+    total_jobs = len(rows)
+    markdown_rows = [row for row in rows if isinstance(row.extracted_text, str) and row.extracted_text.strip()]
+    markdown_count = len(markdown_rows)
+
+    success_rate = (markdown_count / total_jobs * 100.0) if total_jobs else 0.0
+
+    avg_length = (
+        sum(len(row.extracted_text) for row in markdown_rows) / markdown_count if markdown_count else 0.0
+    )
+
+    per_job_scores = [
+        {
+            "request_id": row.request_id,
+            "quality_score": round(_estimate_markdown_quality_score(row.extracted_text) * 100.0, 2),
+            "markdown_length": len(row.extracted_text),
+        }
+        for row in markdown_rows
+    ]
+
+    estimated_accuracy = (
+        sum(item["quality_score"] for item in per_job_scores) / len(per_job_scores)
+        if per_job_scores
+        else 0.0
+    )
+
+    return {
+        "total_jobs": total_jobs,
+        "jobs_with_markdown": markdown_count,
+        "success_rate_percent": round(success_rate, 2),
+        "average_markdown_length": round(avg_length, 2),
+        "estimated_accuracy_percent": round(estimated_accuracy, 2),
+        "accuracy_note": "Estimated from text quality heuristics. True OCR accuracy requires ground-truth comparison.",
+        "per_job_quality": per_job_scores,
+    }

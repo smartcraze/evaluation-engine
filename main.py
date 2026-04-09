@@ -8,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 
 from services.datalab import convert_to_markdown_via_sdk, submit_for_webhook_processing
 from services.evaluator import DEFAULT_MAX_MARKS, DEFAULT_MODEL, EvaluationError, evaluate_exam_text
-from services.storage import get_job, init_db, save_evaluation, upsert_job
+from services.storage import get_job, get_markdown_metrics, init_db, save_evaluation, upsert_job
 
 load_dotenv()
 
@@ -16,18 +16,34 @@ app = FastAPI()
 
 BASE_DIR = Path(__file__).resolve().parent
 PUBLIC_DIR = BASE_DIR / "public"
+EXTRACTED_DIR = PUBLIC_DIR / "extracted"
 
 app.mount("/public", StaticFiles(directory=str(PUBLIC_DIR)), name="public")
 
 
 @app.on_event("startup")
 async def startup() -> None:
+    EXTRACTED_DIR.mkdir(parents=True, exist_ok=True)
     await init_db()
 
 
 @app.get("/")
 async def serve_frontend() -> FileResponse:
     return FileResponse(str(PUBLIC_DIR / "index.html"))
+
+
+def _save_markdown_file(request_id: str, markdown: str) -> tuple[str, str]:
+    safe_request_id = "".join(ch for ch in request_id if ch.isalnum() or ch in {"-", "_"})
+    if not safe_request_id:
+        safe_request_id = "extracted"
+
+    markdown_file_name = f"{safe_request_id}.md"
+    markdown_file_path = EXTRACTED_DIR / markdown_file_name
+    markdown_file_path.write_text(markdown, encoding="utf-8")
+
+    relative_path = f"public/extracted/{markdown_file_name}"
+    public_url = f"/public/extracted/{markdown_file_name}"
+    return relative_path, public_url
 
 
 
@@ -39,15 +55,22 @@ async def _convert_localhost(file: UploadFile) -> dict:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Datalab conversion failed: {exc}") from exc
 
     request_id = result["request_id"]
     markdown = result["markdown"]
+    markdown_file_path, markdown_url = _save_markdown_file(request_id, markdown)
     await upsert_job(
         request_id=request_id,
         status="received",
         mode="localhost-sdk-auto-poll",
         extracted_text=markdown,
-        payload={"source": "datalab-sdk-auto-poll"},
+        payload={
+            "source": "datalab-sdk-auto-poll",
+            "markdown_file_path": markdown_file_path,
+            "markdown_url": markdown_url,
+        },
     )
 
     return {
@@ -55,6 +78,8 @@ async def _convert_localhost(file: UploadFile) -> dict:
         "request_id": request_id,
         "markdown_length": len(markdown),
         "mode": "localhost-sdk-auto-poll",
+        "markdown_file_path": markdown_file_path,
+        "markdown_url": markdown_url,
     }
 
 
@@ -76,6 +101,8 @@ async def convert_webhook(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Datalab submission failed: {exc}") from exc
 
     request_id = result["request_id"]
     await upsert_job(
@@ -109,11 +136,20 @@ async def datalab_webhook(request: Request):
         raise HTTPException(status_code=400, detail="request_id or job_id is required")
 
     extracted_text = data.get("markdown") or data.get("extracted_text")
+    existing = await get_job(str(request_id))
+    merged_payload = dict(existing.payload or {}) if existing and existing.payload else {}
+    merged_payload.update(data)
+
+    if extracted_text:
+        markdown_file_path, markdown_url = _save_markdown_file(str(request_id), extracted_text)
+        merged_payload["markdown_file_path"] = markdown_file_path
+        merged_payload["markdown_url"] = markdown_url
+
     await upsert_job(
         request_id=str(request_id),
         status="received",
         extracted_text=extracted_text,
-        payload=data,
+        payload=merged_payload,
     )
 
     return {"status": "received"}
@@ -133,7 +169,14 @@ async def get_result(request_id: str):
         "matched_keywords": job.matched_keywords,
         "missing_keywords": job.missing_keywords,
         "model": job.model_name,
+        "markdown_file_path": (job.payload or {}).get("markdown_file_path") if job.payload else None,
+        "markdown_url": (job.payload or {}).get("markdown_url") if job.payload else None,
     }
+
+
+@app.get("/metrics/markdown")
+async def markdown_metrics():
+    return await get_markdown_metrics()
 
 
 @app.post("/evaluate/{request_id}")
