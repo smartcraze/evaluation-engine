@@ -18,6 +18,8 @@ This project demonstrates practical full-stack engineering skills recruiters loo
 - Persistent result lookup API (`/result/{request_id}`).
 - OCR quality metrics endpoint with heuristic scoring (`/metrics/markdown`).
 - Static frontend served from FastAPI for manual testing and demos (`/`).
+## API DOCS
+<img width="2852" height="1610" alt="image" src="https://github.com/user-attachments/assets/037edae1-808b-46b1-b759-72b47fde560d" />
 
 ## System Architecture
 
